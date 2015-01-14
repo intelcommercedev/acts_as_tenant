@@ -1,16 +1,16 @@
 module ActsAsTenant
-  @@tenant_klass = nil
+  @@tenant_klass = {}
 
-  def self.set_tenant_klass(klass)
-    @@tenant_klass = klass
+  def self.set_tenant_klass(class_name, klass)
+    @@tenant_klass[class_name] = klass
   end
 
-  def self.tenant_klass
-    @@tenant_klass
+  def self.tenant_klass(class_name)
+    @@tenant_klass[class_name]
   end
 
-  def self.fkey
-    "#{@@tenant_klass.to_s}_id"
+  def self.fkey(class_name)
+    "#{@@tenant_klass[class_name].to_s}_id"
   end
 
   def self.current_tenant=(tenant)
@@ -19,6 +19,10 @@ module ActsAsTenant
 
   def self.current_tenant
     RequestStore.store[:current_tenant]
+  end
+
+  def self.current_tenant_klass
+    RequestStore.store[:current_tenant].class.name.downcase.to_sym
   end
 
   def self.with_tenant(tenant, &block)
@@ -42,26 +46,32 @@ module ActsAsTenant
 
     module ClassMethods
       def acts_as_tenant(tenant = :account, options = {})
-        ActsAsTenant.set_tenant_klass(tenant)
+        class_name = self.name
+        ActsAsTenant.set_tenant_klass(class_name, tenant)
 
         # Create the association
         valid_options = options.slice(:foreign_key, :class_name)
-        fkey = valid_options[:foreign_key] || ActsAsTenant.fkey
+        fkey = valid_options[:foreign_key] || ActsAsTenant.fkey(class_name)
+
         belongs_to tenant, valid_options
 
-        default_scope lambda {
-          if ActsAsTenant.configuration.require_tenant && ActsAsTenant.current_tenant.nil?
-            raise ActsAsTenant::Errors::NoTenantSet
-          end
-          where(fkey.to_sym => ActsAsTenant.current_tenant.id) if ActsAsTenant.current_tenant
-        }
+        scope :with_current_tenant,
+              lambda {
+                if ActsAsTenant.configuration.require_tenant && ActsAsTenant.current_tenant.nil?
+                  raise ActsAsTenant::Errors::NoTenantSet
+                end
+                where(fkey.to_sym => ActsAsTenant.current_tenant.id)  if ActsAsTenant.current_tenant &&
+                    ActsAsTenant.current_tenant_klass == ActsAsTenant.tenant_klass(class_name)
+              }
+
+        default_scope lambda { with_current_tenant }
 
         # Add the following validations to the receiving model:
         # - new instances should have the tenant set
         # - validate that associations belong to the tenant, currently only for belongs_to
         #
         before_validation Proc.new {|m|
-          if ActsAsTenant.current_tenant
+          if ActsAsTenant.current_tenant && ActsAsTenant.current_tenant_klass == ActsAsTenant.tenant_klass(class_name)
             m.send "#{fkey}=".to_sym, ActsAsTenant.current_tenant.id
           end
         }, :on => :create
@@ -89,12 +99,12 @@ module ActsAsTenant
           write_attribute("#{fkey}", integer)
         end
 
-        define_method "#{ActsAsTenant.tenant_klass.to_s}=" do |model|
+        define_method "#{ActsAsTenant.tenant_klass(class_name).to_s}=" do |model|
           raise ActsAsTenant::Errors::TenantIsImmutable unless new_record? || send(fkey).nil?
           super(model)
         end
 
-        define_method "#{ActsAsTenant.tenant_klass.to_s}" do
+        define_method "#{ActsAsTenant.tenant_klass(class_name).to_s}" do
           if !ActsAsTenant.current_tenant.nil? && send(fkey) == ActsAsTenant.current_tenant.id
             return ActsAsTenant.current_tenant
           else
@@ -111,8 +121,9 @@ module ActsAsTenant
 
       def validates_uniqueness_to_tenant(fields, args ={})
         raise ActsAsTenant::Errors::ModelNotScopedByTenant unless respond_to?(:scoped_by_tenant?)
-        fkey = reflect_on_association(ActsAsTenant.tenant_klass).foreign_key
-        #tenant_id = lambda { "#{ActsAsTenant.fkey}"}.call
+        class_name = self.name
+        fkey = reflect_on_association(ActsAsTenant.tenant_klass(class_name)).foreign_key
+
         if args[:scope]
           args[:scope] = Array(args[:scope]) << fkey
         else
