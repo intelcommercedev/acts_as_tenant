@@ -22,7 +22,7 @@ module ActsAsTenant
   end
 
   def self.current_tenant_klass
-    RequestStore.store[:current_tenant].class.name.downcase.to_sym
+    RequestStore.store[:current_tenant].class.name.demodulize.downcase.to_sym
   end
 
   def self.with_tenant(tenant, &block)
